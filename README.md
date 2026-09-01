@@ -1,0 +1,141 @@
+# AllStar Net Transcriber (KJ7T fork)
+
+Capture, transcribe and log amateur radio net traffic from an AllStarLink hub node.
+
+This is a fork of [KK7NQN-TranscriptionLogger](https://github.com/Wintergrasped/KK7NQN-TranscriptionLogger) by Hunter Inman (KK7NQN), with several bug fixes, a plain-text transcript viewer, and the capture and transcription components the upstream project references but does not include.
+
+Tested in production on AllStarLink hub node 588416 against five live nets on four repeaters over three days.
+
+---
+
+## What it does
+
+```
+PTT-keyed audio  →  Whisper transcription  →  MariaDB  →  regex net detection  →  web viewer
+```
+
+1. **`ami_ptt_recorder.py`** listens to Asterisk's AMI and records each transmission as its own WAV via MixMonitor.
+2. **`transcribe_watcher.py`** picks up finished WAVs and hands each to the transcriber.
+3. **`transcribe_and_log.py`** runs faster-whisper and writes the text to MariaDB.
+4. **`Transcript_Analyzer.py`** groups transcripts into sessions, scores each one for net-like language, and writes a `net_data` record when it finds one.
+5. **`netviewer.py`** serves a web page for querying transcripts by time range, exporting them as plain text, and naming detected nets.
+
+Steps 1–3 and 5 run continuously as systemd services. Step 4 runs on a five-minute timer.
+
+---
+
+## Three ways to run this
+
+The pieces are independent services, so you can run only the parts you need.
+
+**Net logging** — the original purpose. Run everything. Expect to tune the phrase lists in `Transcript_Analyzer.py` to match how the nets you monitor actually talk; see *Tuning detection* below. This is the one configuration that requires calibration.
+
+**Repeater archive** — you own or help run a repeater and want a searchable record of traffic. Run the recorder, watcher, transcriber and viewer, and **never enable `allstar-transcript-analyzer.timer`**. You get a time-range-searchable transcript archive with no scoring, no net records, and nothing to tune.
+
+**Accessibility** — following a net you can't hear well, or catching up on one you missed. Same configuration as the archive case. Transcription quality is what matters here, and disabling the VAD filter (see below) makes a substantial difference on marginal RF audio.
+
+> **This is an asynchronous service, not live captioning.** Transcripts appear seconds to minutes after a transmission ends. The architecture has a floor of one transmission — a WAV must be closed before it can be transcribed — so even adding auto-refresh to the viewer would not get you word-by-word captioning during someone's over. That would need a different capture approach entirely.
+
+---
+
+## Requirements
+
+- An AllStarLink node running Asterisk, with AMI enabled and `app_mixmonitor.so` loaded
+- Python 3.9+
+- MariaDB or MySQL
+- `faster-whisper`, `flask`, `mysql-connector-python` in a virtualenv
+- Optional: `psutil`, for the analyzer's CPU-throttle check
+
+**Bind AMI to localhost.** Check `manager.conf` for `bindaddr = 0.0.0.0` before you go any further. During this project's build that port was found open to the internet and being actively scanned.
+
+---
+
+## Setup
+
+1. Import the database schema from the upstream repo (`Database/MainDatabase.sql`) and create a database user.
+2. Copy `env.example` to `ami.env` and `netviewer.env`, fill in your values, and `chmod 600` both.
+3. Create the recording directories, owned by the user Asterisk runs as:
+
+```bash
+sudo mkdir -p /opt/allstar-transcriber/recordings/{staging,incoming,processed,failed}
+sudo chown -R asterisk:asterisk /opt/allstar-transcriber/recordings
+sudo chmod 2775 /opt/allstar-transcriber/recordings/*
+```
+
+4. Install the systemd units from `systemd/`, then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now allstar-ptt-recorder allstar-transcribe-watcher allstar-netviewer
+sudo systemctl enable --now allstar-transcript-analyzer.timer   # net logging only
+```
+
+**Set `PYTHONUNBUFFERED=1` in every unit.** Without it Python block-buffers stdout when systemd captures it, and every timestamp in your journal is a buffer-flush time rather than an event time. This is not cosmetic — during development it misdirected a bug hunt for an hour by making complete files look as though they had been rejected twenty-five minutes after they finished writing.
+
+---
+
+## Tuning detection
+
+`Transcript_Analyzer.py` scores each session and logs a net when the total reaches `NET_SCORE_THRESHOLD` (default 1.0).
+
+| Signal | Weight |
+|---|---|
+| Strong phrase (`welcome to ... net`, `net control`, `any check-ins`, …) | 0.6 |
+| Weak phrase (`roll call`, `check-in(s)`, `in and out`, `for the log`, …) | 0.3 |
+| 12 or more unique callsigns in the session | +0.2 |
+| Session duration between 20 and 120 minutes | +0.2 |
+| Session starts on the hour or half hour | +0.1 |
+
+Each phrase contributes its weight **once**, however many times it occurs. The true count is still recorded in `keyword_hits` for diagnostics. Without that cap a chatty net control saying "in and out" a dozen times scores 3.6 on that phrase alone, and any conversation containing common net vocabulary a few times would be logged as a net.
+
+**Expect to adjust the phrase lists for your repeaters.** Across five live captures, one net produced only a single phrase hit in 97 minutes; another cleared the threshold on weak phrases alone. The three phrases added in this fork were chosen from operator knowledge of specific nets and validated afterward — two of the three contributed nothing on the first net that tested them.
+
+**Set the threshold to match your error preference.** A missed net is effectively permanent: once a session is scored `is_net=0`, the fetch query never revisits it. So if you are logging nets, bias low. If you are archiving general traffic, bias high or leave the analyzer off entirely.
+
+**Session naming is unreliable.** `extract_net_name()` derives names from speech, and speech recognition mangles them — real output from this fork includes "In The Technical Discussions During" and "What Do You Have". Use the rename field in the viewer. A node-and-schedule lookup table would be the proper fix and is not yet built.
+
+---
+
+## Notes on transcription quality
+
+`transcribe_and_log.py` runs faster-whisper with **`vad_filter=False`**. This is deliberate. The Silero VAD pre-filter is tuned for clean audio and discards real speech on weak, noisy RF links — on this node it was blanking about a third of all transmissions, including several that were five to seven seconds long. Whisper's own `no_speech_threshold`, `log_prob_threshold` and `compression_ratio_threshold` remain active as the defence against transcribing noise.
+
+Callsigns are the weak point. Whisper renders them phonetically ("Helo Echo 6, Romeo Alpha X-ray" for KE6RAX), hyphenated, or simply wrong ("Neck control" for "net control" — which cost a strong-phrase hit in one capture). Short 2×1 calls degrade worst, having the least redundancy. Do not treat the callsign extraction as authoritative.
+
+---
+
+## Viewer
+
+`netviewer.py` serves on port 8088, bound to all interfaces — reach it over a VPN, not the open internet. It has no authentication, and one write path (renaming a detected net).
+
+- Query transcripts by start and end time
+- **Download .txt** — plain text, one transmission per line, with a header giving the window and any detected net. Formatted for pasting into an LLM rather than for a spreadsheet.
+- Rename a detected net inline, updating both `net_data` and `transcription_analysis`
+
+---
+
+## AI assistance
+
+The upstream project includes an optional AI refinement path (`ai_backend.py`, defaulting to a local vLLM server, with OpenAI as an alternative). It is **disabled by default and untested in this fork.**
+
+The workflow used here instead is manual: export a transcript with the viewer's Download button and paste it into whatever assistant you already use. This handles the things regex cannot — reconstructing callsigns from phonetics, identifying net control, summarising — while keeping a human in the loop and requiring no API key, no cost, and no external dependency in the pipeline.
+
+If you do enable the built-in path, note that `_compact_rows()` in `ai_backend.py` discards any transmission without a keyword or a regex-matchable callsign before the model sees it, which throws away exactly the phonetic spellouts a model is best at decoding.
+
+---
+
+## Licensing
+
+This project is a fork of [KK7NQN-TranscriptionLogger](https://github.com/Wintergrasped/KK7NQN-TranscriptionLogger) by Hunter Inman (KK7NQN), distributed under the **GPLv3** as required by the upstream license. Modified files carry notices describing what changed and when.
+
+Three components are original work by Tom Salzer (KJ7T) and are additionally available under the **MIT license**: `ami_ptt_recorder.py`, `transcribe_and_log.py`, and `netviewer.py`. They do not import upstream code and can be reused independently. See `LICENSE-MIT`.
+
+See `CHANGES.md` for the full list of modifications and the reasoning behind each.
+
+---
+
+## Credits
+
+Built on Hunter Inman's (KK7NQN) work, presented at the inaugural Zero Retries Digital Conference in Everett, Washington, September 2025. The session-scoring approach, database schema, and analyzer are his.
+
+Fixes and additions by Tom Salzer, KJ7T — [EtherHam](https://etherham.com).
