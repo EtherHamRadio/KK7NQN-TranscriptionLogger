@@ -1,4 +1,24 @@
 #!/usr/bin/env python3
+#
+# MODIFIED 2026-09-01 by Tom Salzer (KJ7T).
+#
+# Changes from the upstream KK7NQN-TranscriptionLogger release:
+#   - main(): defer scoring of sessions still within SESSION_GAP_MIN of now, so
+#     a live net accumulates across timer runs instead of being scored in
+#     five-minute fragments that each fall below threshold and are then never
+#     revisited (is_net=0 rows are excluded from re-fetch permanently).
+#   - CALLSIGN_RE: prefix class [A-KN-PR-Z] -> [A-PR-Z], restoring L and M.
+#     KL7, KM7, WL, AL, NL and NM are valid US prefixes and were invisible.
+#   - NET_WEAK_PHRASES: added check-in(s), "in and out", "for the log".
+#   - score_session_for_net(): cap each phrase's score contribution at one hit
+#     (max_credit) while still recording the true count in keyword_hits.
+#   - NET_SCORE_THRESHOLD env var replaces the hardcoded 1.0 threshold.
+#   - Removed the hardcoded database password default.
+#
+# Original work Copyright (c) Hunter Inman (KK7NQN).
+# Licensed under the GNU General Public License v3.0, as is this modified
+# version. See LICENSE in the repository root.
+#
 """
 Transcript_Analyzer.py — regex-first with optional AI assist (full, updated)
 
@@ -64,9 +84,9 @@ logger = logging.getLogger("TranscriptAnalyzer")
 
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
-DB_USER = "DB_USER"
-DB_PASS = "DB_PASS"
-DB_NAME = "DB_NAME"
+DB_USER = os.getenv("DB_USER", "transcriber")
+DB_PASS = os.getenv("DB_PASS", "")
+DB_NAME = os.getenv("DB_NAME", "repeater")
 
 CPU_THRESHOLD = float(os.getenv("CPU_THRESHOLD", "50"))
 BATCH_LIMIT = int(os.getenv("BATCH_LIMIT", "2000"))
@@ -78,13 +98,18 @@ CLUB_NAME_MAX = int(os.getenv("CLUB_NAME_MAX", "255"))
 NET_NAME_WORDS_MAX = int(os.getenv("NET_NAME_WORDS_MAX", "10"))
 NET_NAME_CHARS_MAX = int(os.getenv("NET_NAME_CHARS_MAX", "60"))
 RESCAN_MINUTES = int(os.getenv("RESCAN_MINUTES", "120"))
+# Score at or above which a session is logged as a net. Lower it if you would
+# rather catch every net and discard the odd false positive; raise it if you are
+# archiving general repeater traffic and a spurious net record is worse than a
+# missed one. See "Tuning detection" in the README.
+NET_SCORE_THRESHOLD = float(os.getenv("NET_SCORE_THRESHOLD", "1.0"))
 
 AI_MIN_CONF = float(os.getenv("AI_MIN_CONF", "0.65"))
 AI_FORCE = os.getenv("AI_FORCE", "0") == "1"
 AI_LOG = os.getenv("AI_LOG", "0") == "1"
 
 # --------------- Regexes ---------------
-CALLSIGN_RE = re.compile(r"\b([A-KN-PR-Z]{1,2}\d{1,4}[A-Z]{1,3})(?:\/[A-Z0-9]+)?\b", re.I)
+CALLSIGN_RE = re.compile(r"\b([A-PR-Z]{1,2}\d{1,4}[A-Z]{1,3})(?:\/[A-Z0-9]+)?\b", re.I)
 
 NET_STRONG_PHRASES = [
     r"\bwelcome to (?:the )?.+? net\b",
@@ -98,6 +123,12 @@ NET_WEAK_PHRASES = [
     r"\broll call\b",
     r"\btraffic (?:for|from) the net\b",
     r"\bnet logger\b",
+    # Added by KJ7T: net jargon that essentially never appears in ordinary
+    # ragchew. Chosen from operator knowledge, then validated against live
+    # captures on three repeaters.
+    r"\bcheck(?:ing)?[- ]?ins?\b",
+    r"\bin and out\b",
+    r"\bfor the log\b",
 ]
 
 PHRASE_NET_NAME_PATS = [
@@ -525,13 +556,18 @@ def score_session_for_net(sess: Session) -> Tuple[float, Dict[str,int]]:
     score = 0.0
     hits: Dict[str,int] = {}
 
-    def add_hits(patterns: List[str], weight: float):
+    def add_hits(patterns: List[str], weight: float, max_credit: int = 1):
         nonlocal score
         for p in patterns:
             c = len(re.findall(p, text))
             if c:
+                # Record the true count for diagnostics, but credit the score
+                # only max_credit times. Repetition is not proportionally
+                # stronger evidence, and common phrases such as "in and out"
+                # can occur a dozen times in a single net -- uncapped, one
+                # phrase alone would clear any sane threshold.
                 hits[p] = hits.get(p, 0) + c
-                score += weight * c
+                score += weight * min(c, max_credit)
 
     add_hits(NET_STRONG_PHRASES, 0.6)
     add_hits(NET_WEAK_PHRASES, 0.3)
@@ -578,13 +614,35 @@ def main():
         sessions = make_sessions(tx, SESSION_GAP_MIN)
         logger.info(f"Built {len(sessions)} sessions (gap >= {SESSION_GAP_MIN} min)")
 
+        # Only score sessions that have gone quiet for the full gap window.
+        # A session whose last transcript is still "recent" may still be
+        # growing; scoring it now risks locking in a low score (is_net=0) on a
+        # partial net, and is_net=0 rows are never re-fetched later. Leaving an
+        # active session unwritten keeps its transcripts eligible for the next
+        # run, so a live net accumulates across runs and is scored once, whole.
+        now = datetime.now()
+        closed, deferred = [], 0
+        for sess in sessions:
+            if sess.end_time and (now - sess.end_time).total_seconds() < SESSION_GAP_MIN * 60:
+                deferred += 1
+                continue
+            closed.append(sess)
+        if deferred:
+            logger.info(f"Deferring {deferred} still-active session(s) "
+                        f"(< {SESSION_GAP_MIN} min quiet) to a later run.")
+        sessions = closed
+        if not sessions:
+            logger.info("No closed sessions to analyze this run.")
+            cnx.rollback()
+            return
+
         # Load phonetic corrections once
         corr_map = load_corrections_map(cur)
 
         for sess in sessions:
             score, hits = score_session_for_net(sess)
             text_blob = sess.text_blob
-            is_net = 1 if score >= 1.0 else 0
+            is_net = 1 if score >= NET_SCORE_THRESHOLD else 0
 
             net_id: Optional[int] = None
             net_name = extract_net_name(text_blob)
