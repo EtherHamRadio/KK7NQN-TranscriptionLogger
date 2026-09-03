@@ -2,9 +2,9 @@
 
 Capture, transcribe and log amateur radio net traffic from an AllStarLink hub node.
 
-This is a fork of [KK7NQN-TranscriptionLogger](https://github.com/Wintergrasped/KK7NQN-TranscriptionLogger) by Hunter Inman (KK7NQN), with several bug fixes, a plain-text transcript viewer, and the capture and transcription components the upstream project references but does not include.
+This is a fork of [KK7NQN-TranscriptionLogger](https://github.com/Wintergrasped/KK7NQN-TranscriptionLogger) by Hunter Inman (KK7NQN), with several bug fixes, a plain-text transcript viewer, a deterministic callsign resolver, and the capture and transcription components the upstream project references but does not include.
 
-Tested in production on AllStarLink hub node 588416 against five live nets on four repeaters over three days.
+Tested in production on AllStarLink hub node 588416 against live nets on four repeaters.
 
 ---
 
@@ -12,15 +12,17 @@ Tested in production on AllStarLink hub node 588416 against five live nets on fo
 
 ```
 PTT-keyed audio  →  Whisper transcription  →  MariaDB  →  regex net detection  →  web viewer
+                                                       →  phonetic callsign resolution
 ```
 
 1. **`ami_ptt_recorder.py`** listens to Asterisk's AMI and records each transmission as its own WAV via MixMonitor.
 2. **`transcribe_watcher.py`** picks up finished WAVs and hands each to the transcriber.
 3. **`transcribe_and_log.py`** runs faster-whisper and writes the text to MariaDB.
 4. **`Transcript_Analyzer.py`** groups transcripts into sessions, scores each one for net-like language, and writes a `net_data` record when it finds one.
-5. **`netviewer.py`** serves a web page for querying transcripts by time range, exporting them as plain text, and naming detected nets.
+5. **`callsign_resolver.py`** converts spoken phonetics into callsigns and records them with a confidence and provenance.
+6. **`netviewer.py`** serves a web page for querying transcripts by time range, exporting them as plain text, and naming detected nets.
 
-Steps 1–3 and 5 run continuously as systemd services. Step 4 runs on a five-minute timer.
+Steps 1–3 and 6 run continuously as systemd services. Steps 4 and 5 run on five-minute timers and are independently optional.
 
 ---
 
@@ -30,7 +32,7 @@ The pieces are independent services, so you can run only the parts you need.
 
 **Net logging** — the original purpose. Run everything. Expect to tune the phrase lists in `Transcript_Analyzer.py` to match how the nets you monitor actually talk; see *Tuning detection* below. This is the one configuration that requires calibration.
 
-**Repeater archive** — you own or help run a repeater and want a searchable record of traffic. Run the recorder, watcher, transcriber and viewer, and **never enable `allstar-transcript-analyzer.timer`**. You get a time-range-searchable transcript archive with no scoring, no net records, and nothing to tune.
+**Repeater archive** — you own or help run a repeater and want a searchable record of traffic. Run the recorder, watcher, transcriber and viewer, and **never enable `allstar-transcript-analyzer.timer`**. You get a time-range-searchable transcript archive with no scoring, no net records, and nothing to tune. The callsign resolver is worth running in this configuration — it makes the archive searchable by station without any net detection at all.
 
 **Accessibility** — following a net you can't hear well, or catching up on one you missed. Same configuration as the archive case. Transcription quality is what matters here, and disabling the VAD filter (see below) makes a substantial difference on marginal RF audio.
 
@@ -72,6 +74,24 @@ sudo systemctl enable --now allstar-transcript-analyzer.timer   # net logging on
 
 **Set `PYTHONUNBUFFERED=1` in every unit.** Without it Python block-buffers stdout when systemd captures it, and every timestamp in your journal is a buffer-flush time rather than an event time. This is not cosmetic — during development it misdirected a bug hunt for an hour by making complete files look as though they had been rejected twenty-five minutes after they finished writing.
 
+### Optional: the callsign resolver
+
+Additive and entirely opt-in. It creates three new tables and changes nothing upstream.
+
+```bash
+sudo mysql <your-database> < callsign_resolver_schema.sql
+cp services.env.example /opt/allstar-transcriber/services.env
+sudo systemctl enable --now allstar-callsign-resolver.timer
+```
+
+Then populate from your existing history:
+
+```bash
+/opt/allstar-transcriber/venv/bin/python3 callsign_resolver.py --rescan-all
+```
+
+To remove it: disable the timer and drop `callsign_mentions`, `callsign_roster` and `callsign_scan_log`.
+
 ---
 
 ## Tuning detection
@@ -100,7 +120,44 @@ Each phrase contributes its weight **once**, however many times it occurs. The t
 
 `transcribe_and_log.py` runs faster-whisper with **`vad_filter=False`**. This is deliberate. The Silero VAD pre-filter is tuned for clean audio and discards real speech on weak, noisy RF links — on this node it was blanking about a third of all transmissions, including several that were five to seven seconds long. Whisper's own `no_speech_threshold`, `log_prob_threshold` and `compression_ratio_threshold` remain active as the defence against transcribing noise.
 
-Callsigns are the weak point. Whisper renders them phonetically ("Helo Echo 6, Romeo Alpha X-ray" for KE6RAX), hyphenated, or simply wrong ("Neck control" for "net control" — which cost a strong-phrase hit in one capture). Short 2×1 calls degrade worst, having the least redundancy. Do not treat the callsign extraction as authoritative.
+### A bigger model does not fix callsigns
+
+Callsigns are the weak point, so the obvious move is a larger Whisper model. It was benchmarked on real captured audio and rejected, along with two other ways of making the transcriber smarter. All three made callsigns **worse**:
+
+| Attempt | Result |
+|---|---|
+| `medium` instead of `small` | 2.9× slower; rendered "foxtrot zero" as **"Flaxstrad 0"** |
+| `initial_prompt` seeded with phonetics and callsigns | Emitted **"KJ7T-OR."** — straight out of the primer — on unintelligible audio |
+| `hotwords` with a callsign list | Produced **"KiloFoxTrad0"** and **"MIK9 SIERRA ALFAYANKI"** |
+
+A larger language model has a stronger prior about what English sounds like, and the phonetic alphabet is deliberately built from words that do not sound like ordinary English. The prior fights the vocabulary. Priming is worse still: a model told to expect callsigns will produce one when it hears nothing at all.
+
+So this fork stays on `small` with `int8`, and resolves callsigns afterward with a lookup table. `small`'s literal "Whiskey Bravo 3, Charlie, Sierra Yankee" looks like a failure and is the most useful output available, because it converts deterministically.
+
+Benchmark on your own audio before switching models — the result may differ on cleaner RF.
+
+---
+
+## Callsign resolution
+
+`callsign_resolver.py` runs after transcription and records each callsign it finds with a method, a confidence, and the text that produced it.
+
+| Method | Confidence | Example |
+|---|---|---|
+| `literal` | 1.0 | `AI6US` already in callsign form |
+| `phonetic` | 0.9 | `Whiskey Bravo 3 Charlie Sierra Yankee` → WB3CSY |
+| `compact` | 0.8 | `KN6, USH` → KN6USH |
+| `roster_fix` | 0.6 | `D9UJK` → KD9UJK, repaired from previously-heard calls |
+
+On 1,754 transmissions it found 461 mentions, **including more than 30 callsigns that no regex can see** because they appear only as spoken phonetics.
+
+The phonetic map is read from upstream's `corrections` table and merged over the script's built-ins, so a newly observed mangling is one `INSERT` rather than a code change. `--show-map` prints what is in effect.
+
+**The commonest error is head truncation** — the first phonetic word is clipped, probably by PTT key-up. `KD9UJK` arrives as `D9UJK`. Two rules handle it: a prefix-validity check (only B, F, G, I, K, M, N, R and W exist as single-character prefixes worldwide, so truncations land on impossible prefixes), and an optional roster repair that completes a truncation from previously-heard callsigns.
+
+**Roster repair is off by default and is the one pass that can be confidently wrong.** If two real stations differ only by a leading character, it will merge them. Repairs are recorded at 0.6 with the heard form preserved in `matched_text`. Review them.
+
+Treat resolved callsigns as good evidence, not as authoritative. See `CHANGES.md` for the full list of known limits.
 
 ---
 
@@ -118,7 +175,12 @@ Callsigns are the weak point. Whisper renders them phonetically ("Helo Echo 6, R
 
 The upstream project includes an optional AI refinement path (`ai_backend.py`, defaulting to a local vLLM server, with OpenAI as an alternative). It is **disabled by default and untested in this fork.**
 
-The workflow used here instead is manual: export a transcript with the viewer's Download button and paste it into whatever assistant you already use. This handles the things regex cannot — reconstructing callsigns from phonetics, identifying net control, summarising — while keeping a human in the loop and requiring no API key, no cost, and no external dependency in the pipeline.
+The workflow used here instead is manual: export a transcript with the viewer's Download button and paste it into whatever assistant you already use. This handles the things regex cannot — summarising, identifying net control — while keeping a human in the loop and requiring no API key, no cost, and no external dependency in the pipeline.
+
+Two findings from doing that in anger, both worth knowing before you wire a model into anything:
+
+- **A model with a full context window does not tell you it only read part of your input.** A local model on a small default context silently discarded the beginning of a transcript and produced a fluent, confident, entirely accurate summary of the wrong net.
+- **Assistants reconstruct callsigns plausibly rather than correctly, and rarely flag the difference.** In one comparison the model produced `KB3CSY` where the operator's own phonetic ID gave `WB3CSY`. Both spellings were in the transcript; nothing marked the conflict. This is what the resolver's confidence and `matched_text` columns exist to make visible.
 
 If you do enable the built-in path, note that `_compact_rows()` in `ai_backend.py` discards any transmission without a keyword or a regex-matchable callsign before the model sees it, which throws away exactly the phonetic spellouts a model is best at decoding.
 
@@ -128,7 +190,7 @@ If you do enable the built-in path, note that `_compact_rows()` in `ai_backend.p
 
 This project is a fork of [KK7NQN-TranscriptionLogger](https://github.com/Wintergrasped/KK7NQN-TranscriptionLogger) by Hunter Inman (KK7NQN), distributed under the **GPLv3** as required by the upstream license. Modified files carry notices describing what changed and when.
 
-Three components are original work by Tom Salzer (KJ7T) and are additionally available under the **MIT license**: `ami_ptt_recorder.py`, `transcribe_and_log.py`, and `netviewer.py`. They do not import upstream code and can be reused independently. See `LICENSE-MIT`.
+Four components are original work by Tom Salzer (KJ7T) and are additionally available under the **MIT license**: `ami_ptt_recorder.py`, `transcribe_and_log.py`, `netviewer.py`, and `callsign_resolver.py`. They do not import upstream code and can be reused independently. See `LICENSE-MIT`.
 
 See `CHANGES.md` for the full list of modifications and the reasoning behind each.
 
@@ -136,6 +198,6 @@ See `CHANGES.md` for the full list of modifications and the reasoning behind eac
 
 ## Credits
 
-Built on Hunter Inman's (KK7NQN) work, presented at the inaugural Zero Retries Digital Conference in Everett, Washington, September 2025. The session-scoring approach, database schema, and analyzer are his.
+Built on Hunter Inman's (KK7NQN) work, presented at the inaugural Zero Retries Digital Conference in Everett, Washington, September 2025. The session-scoring approach, database schema, and analyzer are his. The `corrections` phonetic map the callsign resolver depends on is also his.
 
 Fixes and additions by Tom Salzer, KJ7T — [EtherHam](https://etherham.com).
