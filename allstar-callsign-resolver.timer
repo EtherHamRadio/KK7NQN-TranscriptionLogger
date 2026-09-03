@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the AllStar callsign resolver every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+# Don't stack runs if one is slow.
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

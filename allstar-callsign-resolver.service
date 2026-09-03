@@ -1,0 +1,17 @@
+[Unit]
+Description=AllStar callsign resolver (phonetics -> callsigns, post-processing)
+After=network.target mariadb.service
+Wants=mariadb.service
+
+[Service]
+Type=oneshot
+# Change this to the account that owns /opt/allstar-transcriber on your system.
+User=thomas
+EnvironmentFile=/opt/allstar-transcriber/db.env
+EnvironmentFile=-/opt/allstar-transcriber/services.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/allstar-transcriber/venv/bin/python3 /opt/allstar-transcriber/callsign_resolver.py
+
+# No Restart= -- this is a oneshot driven by the timer. A failed run simply
+# leaves those rows unscanned and the next run picks them up, because progress
+# is tracked in callsign_scan_log rather than assumed from a clock.
