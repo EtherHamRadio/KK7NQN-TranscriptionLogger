@@ -130,7 +130,17 @@ No authentication. One write path. Do not expose it beyond a VPN.
 
 ## `transcribe_and_log.py` (MIT, new file)
 
-Referenced by the upstream README but not included in the repo.
+Referenced by the upstream README but not included in the repo at the time this fork was made.
+
+**Upstream has since published its own** `Server/transcribe_and_log.py` (2 September 2026, after this one was written). They differ in ways that matter on hardware like this node's, so read this as two answers to the same problem rather than a fix and a mistake:
+
+- Upstream's is **GPU-first** — `device="cuda"`, `compute_type="float16"`, default model `medium.en`. This one is CPU-only by design, on a machine with no GPU.
+- Upstream's **enables the VAD filter by default**. See below for why that is disabled here.
+- Upstream's **raises an error on an empty transcript**. Combined with the watcher in this fork, that would send every kerchunk and silent clip to `failed/`. This one logs the blank and exits successfully.
+- Upstream's additionally supports **whisper.cpp and legacy openai-whisper** backends, which this one does not.
+- Upstream's sets **`condition_on_previous_text=False`**, a hallucination mitigation this one does not currently use. Worth investigating here.
+
+If you have a GPU, start with upstream's. If you are on CPU with marginal RF audio, start with this one.
 
 **`vad_filter=False`** is deliberate. faster-whisper's Silero VAD pre-filter, at default sensitivity, discarded real speech on this node's weak RF audio — 73 of 231 transmissions came back blank, and 54 of those were 1.5 seconds or longer, several running 5–7 seconds with clearly audible speech.
 
