@@ -225,9 +225,27 @@ Merging both tables gained 15 forms not in either alone, and produced **no new f
 
 ---
 
+## `systemd/allstar-recordings.conf` (new file)
+
+Nothing upstream — and nothing in this fork before now — ever deleted a recording. `recordings/processed/` grew without bound from the day the recorder first ran.
+
+**Measured on node 588416 after five days:** 2,082 files, 659 MB in `processed/`, plus 129 MB of pre-fix wreckage in `failed/`. Roughly 320 KB per transmission, about 100 MB per day.
+
+That is not a crisis on a 457 GB disk, and it is exactly the kind of thing nobody notices until it is one.
+
+A `tmpfiles.d` rule keeps 60 days and lets the rest go. It installs to `/etc/tmpfiles.d/` and needs no unit and no timer of its own, because `systemd-tmpfiles-clean.timer` ships enabled on Debian and runs daily. The rule uses type `e`, which cleans an existing directory and never creates one, with mode and ownership left untouched so it cannot disturb the asterisk-owned directories the recorder writes into.
+
+Sixty days rather than a calendar-month purge: a rolling age gives every file the same guarantee, deletes gradually instead of dropping a whole month at once, and needs no month-boundary logic to get wrong. `staging/` and `incoming/` are deliberately excluded — they hold in-flight recordings, not an archive.
+
+**A "purge now" button in the viewer was considered and rejected.** `netviewer.py` has no authentication; a control that permanently deletes recordings does not belong on an unauthenticated page, even behind a VPN.
+
+---
+
 ## Still open
 
 - `start_recording()` has no maximum duration. If a `txkeyed value: 0` event is missed, the channel stays in `active_recordings` indefinitely — MixMonitor keeps writing one growing file and every subsequent transmission on that channel is silently dropped. A duration cap would bound the damage.
+
+  **Confirmed in the wild.** The 210 files left in `failed/` from before the staging fix hold 2.3 hours of audio between them, and the largest is a single recording of **9 minutes 44 seconds** on a node where a typical over runs fifteen to thirty seconds. Those are several overs concatenated: once the watcher moved the file away, `active_recordings` still listed the channel, so every subsequent start was a no-op and Asterisk kept writing into the same detached inode. The audio is intact and the WAV headers are valid — `sox` reads them without complaint — but one file no longer corresponds to one transmission, which is why they were not simply fed back through the pipeline.
 - `extract_ncs()` requires a "this is *callsign* … net control" construction. Neither repeater tested actually talks that way, so `ncs_callsign` has been NULL on every net detected.
 - `detect_topics()` includes the bare word `"for"` in its Swap keyword list, so nearly every transcript is tagged swap-and-shop. Harmless while nothing reads `topic_labels`.
 - Net naming needs a node-and-schedule lookup rather than speech extraction.

@@ -91,6 +91,23 @@ sudo systemctl enable --now allstar-transcript-analyzer.timer   # net logging on
 
 **Set `PYTHONUNBUFFERED=1` in every unit.** Without it Python block-buffers stdout when systemd captures it, and every timestamp in your journal is a buffer-flush time rather than an event time. This is not cosmetic — during development it misdirected a bug hunt for an hour by making complete files look as though they had been rejected twenty-five minutes after they finished writing.
 
+### Recording retention — do this, it is not optional in practice
+
+**Nothing in this pipeline ever deletes a WAV file.** Left alone, `recordings/processed/` grows without bound at roughly 320 KB per transmission, about 100 MB a day on a moderately busy hub. That is an omission in the original design, not a decision, and it is invisible until the disk fills.
+
+```bash
+sudo cp systemd/allstar-recordings.conf /etc/tmpfiles.d/
+systemd-tmpfiles --cat-config | grep -A2 allstar
+```
+
+The second command should print the two `e` rules. If nothing comes back, the file didn't land — stop and check the path before going further.
+
+That's the whole installation. `systemd-tmpfiles-clean.timer` ships enabled on Debian and runs daily, so there is no unit to add and nothing to enable.
+
+The rule keeps 60 days of audio in `processed/` and `failed/`, and deliberately leaves `staging/` and `incoming/` alone since those hold in-flight recordings. Transcripts stay in MariaDB permanently either way — this only ages out the audio. Sixty days is chosen to be long enough to re-run a transcription benchmark against real captures, which is exactly how the model comparison below was done.
+
+To confirm it does nothing harmful before trusting it, count the files, run `sudo systemd-tmpfiles --clean /etc/tmpfiles.d/allstar-recordings.conf`, and count again. On a fresh installation the numbers must be identical, because nothing is old enough to remove yet.
+
 ### Optional: the callsign resolver
 
 Additive and entirely opt-in. It creates three new tables and changes nothing upstream.
