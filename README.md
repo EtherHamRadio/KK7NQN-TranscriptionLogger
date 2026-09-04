@@ -8,6 +8,23 @@ Tested in production on AllStarLink hub node 588416 against live nets on four re
 
 ---
 
+## Not for life-safety use
+
+**Do not use this as a system of record for emergency communications.** Not for fire service, EMS, hospitals, an EOC, formal ARES or RACES traffic, or SKYWARN. If a served agency needs a log of what was said, that log needs a person.
+
+This is not boilerplate. It is what was measured on the node this was built on:
+
+- **A bug silently discarded 16% of all captured audio for days.** 2.3 hours of net traffic. It produced no error, no warning, and nothing in any log saying anything was wrong. It was found by accident during unrelated housekeeping.
+- **Callsigns are best-effort.** The first phonetic word of a callsign is routinely clipped by PTT key-up — net control's own callsign arrived truncated three times in a single net. The resolver repairs some of these and records a confidence, but it can also be confidently wrong.
+- **Two spellings of one station can both appear in the same transcript** with nothing marking the conflict. WB3CSY from the operator's own phonetic ID; KB3CSY from net control's read-back a minute later.
+- **Whisper invents words on silence and noise.** A clip with nothing intelligible in it transcribed as "You". Primed with a callsign vocabulary, the same class of clip produced a plausible-looking callsign that nobody had spoken.
+- **It is asynchronous, not live.** Transcripts appear seconds to minutes after a transmission ends, and the architecture has a floor of one transmission behind. It cannot provide real-time situational awareness.
+- **There is no redundancy and no alerting.** One node, one disk, no monitoring. If it stops, nothing tells you.
+
+Treat a transcript as a searchable aid to memory, not as evidence of what was said. Where accuracy matters, go listen to the audio. Where it matters more than that, have a human keeping the log.
+
+---
+
 ## What it does
 
 ```
